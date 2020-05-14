@@ -1,0 +1,734 @@
+---
+title: "Bike Share"
+author: "Ganesh Sreeram"
+date: "4/8/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+#Loading Packages  
+
+library(rvest)
+library(dplyr)
+library(readr)
+library(rio)
+library(lubridate)
+library(stringr)
+library(tidyr)
+library(timeDate)
+library(ggplot2)
+library(forecast)
+library(lmtest)
+library(class) 
+library(caret)
+library(tree)
+library(randomForest)
+library(gbm)
+library(xgboost)
+library(ranger)
+
+
+```
+
+
+**Question 1** 
+
+```{r}
+url <- "https://bikeshare.metro.net/about/data/"
+
+bikeshare_site_links <- read_html(url) %>% 
+  html_nodes('a') %>% 
+  html_attr("href")
+
+# Get all links ending with zip
+trip_links <- bikeshare_site_links[grep("zip$",bikeshare_site_links)]
+
+# Older bike data doesnt have bike type column, so don't include it
+col_names <- colnames(import(trip_links[1]))[-15]
+
+import_clean <- function(x) {
+  temp <- import(x)[, 1:14]
+  colnames(temp) <- col_names
+  
+  temp <- temp %>%
+    mutate(start_time =
+             case_when(
+               grepl("/", start_time) ~ as.POSIXct(as_datetime(start_time,
+                                                               format = "%m/%d/%Y %H:%M")),
+               TRUE ~ as_datetime(start_time)
+             ))
+  temp
+}
+
+trip_data_list <- lapply(trip_links, import_clean)
+
+trip_data <- do.call("rbind", trip_data_list)
+
+
+```
+
+
+**Question 2** 
+
+```{r}
+hourly_trips <- as_tibble(trip_data)
+
+hourly_trips <- hourly_trips %>% 
+  mutate(date = date(start_time),
+         hour = hour(start_time),
+         month = month(start_time),
+         day = wday(start_time)) %>%
+  group_by(date, hour,month,day) %>% 
+  summarise(num_trips = n()) %>% 
+  arrange(date, hour,month,day)
+```
+
+**Question 3** 
+
+```{r}
+hourly_trips$weekday = weekdays(hourly_trips$date)
+hourly_trips$holiday = isHoliday(as.timeDate(hourly_trips$date))
+
+# check listHolidays() to see if you think we should add others
+holiday_names <- c(listHolidays(pattern = "^US"), "NewYearsDay")
+
+holidays <- 
+  lapply(holiday_names, function(x) as_date(holiday(2016:2020, Holiday = x))) %>% 
+  unlist() %>% 
+  as_date()
+
+hourly_trips <- hourly_trips %>% 
+  mutate(holiday = date %in% holidays)
+
+
+
+```
+
+
+# Quick Vizs
+
+```{r}
+total_by_hour <- hourly_trips %>% 
+  group_by(hour) %>% 
+  summarise(num_trips = sum(num_trips))
+
+barplot(total_by_hour$num_trips, names.arg = total_by_hour$hour)
+
+total_by_day <- hourly_trips %>% 
+  group_by(weekday) %>% 
+  summarise(num_trips = sum(num_trips))
+
+barplot(total_by_day$num_trips, names.arg = total_by_day$weekday)
+
+#Heatmap 
+
+ggplot(hourly_trips, aes(x = weekday, y = hour, fill = num_trips )) +
+geom_tile() +
+scale_fill_gradient(low = "white", high = "darkblue") +
+ggtitle("Heatmap of Bike Rides in LA") +
+xlab("Day of week") +
+ylab ("Hour of day")
+
+#######
+plot(log(hourly_trips$num_trips), type = "l")
+BoxCox.lambda(hourly_trips$num_trips)
+
+plot(BoxCox(hourly_trips$num_trips, lambda = 0.3659624), type = "l")
+
+unique(hourly_trips[hourly_trips$num_trips>150,]$date)
+
+```
+
+
+##Model 1 
+
+
+```{r}
+#Data formats 
+
+hourly_trips$holiday = as.numeric(hourly_trips$holiday)
+hourly_trips$outlier = ifelse(hourly_trips$num_trips>150,1,0)
+hourly_trips$num_trips = as.numeric(hourly_trips$num_trips)
+hourly_trips$hour = as.numeric(hourly_trips$hour)
+hourly_trips$trend = 1:dim(hourly_trips)[1]
+hourly_trips$lag_num_trips = lag(hourly_trips$num_trips)
+hourly_trips$lag2_num_trips = lag(hourly_trips$lag_num_trips)
+hourly_trips$lag_num_trips_day = lag(hourly_trips$num_trips, n = 24L)
+
+
+
+validation_set = hourly_trips[hourly_trips$date >= "2020-03-01",]
+
+```
+
+
+**1. Naive**
+
+```{r}
+hourly_trips$holiday = as.factor(hourly_trips$holiday)
+hourly_trips$outlier = as.factor(hourly_trips$outlier)
+hourly_trips$hour = as.factor(hourly_trips$hour)
+hourly_trips$month = as.factor(hourly_trips$month)
+hourly_trips$day = as.factor(hourly_trips$day)
+
+
+
+
+
+a = unique(validation_set$date)
+prediction = c()
+MAPE = c()
+RMSE = c()
+  
+for (i in 1:length(a)){
+  training_set = hourly_trips[hourly_trips$date < a[i],]
+  b = hourly_trips[hourly_trips$date == a[i],]
+  M = lm(num_trips~lag_num_trips, data = training_set)
+  estimate = predict(M, b)
+  prediction = c(prediction, estimate)
+  x = accuracy(estimate, b$num_trips)
+  MAPE = c(MAPE, x[5])
+  RMSE = c(RMSE, x[2])
+}
+
+#Average MAPE 
+
+avg_mape = mean(MAPE)
+avg_mape
+avg_RMSE = mean(RMSE)
+avg_RMSE
+```
+
+```{r}
+#visualization 
+
+
+plot(MAPE, type = "b")
+
+plot(RMSE, type="b")
+
+validation_set$predicition = prediction 
+
+plot(validation_set$num_trips)
+lines(validation_set$predicition, col = "blue")
+
+plot(M$residuals)
+acf(M$residuals)
+
+```
+
+
+**2. Regression** 
+
+```{r}
+
+a = unique(validation_set$date)
+prediction = c()
+MAPE = c()
+RMSE = c()
+  
+for (i in 1:length(a)){
+  training_set = hourly_trips[hourly_trips$date < a[i],]
+  b = hourly_trips[hourly_trips$date == a[i],]
+  
+  M = lm(num_trips~hour+month+day+holiday+lag_num_trips+lag2_num_trips+outlier+lag_num_trips_day, data = training_set)  
+  
+  estimate = predict(M, b)
+  prediction = c(prediction, estimate)
+  x = accuracy(estimate, b$num_trips)
+  MAPE = c(MAPE, x[5])
+  RMSE = c(RMSE, x[2])
+}
+
+#Average MAPE 
+
+avg_mape = mean(MAPE)
+avg_RMSE = mean(RMSE)
+summary(M)
+avg_mape
+avg_RMSE
+```
+
+```{r}
+#visualization 
+
+
+plot(MAPE, type = "b")
+
+plot(RMSE, type="b")
+
+validation_set$predicition = prediction 
+
+plot(validation_set$num_trips)
+lines(validation_set$predicition, col = "blue")
+
+plot(M$residuals)
+acf(M$residuals)
+
+
+qqnorm(M$residuals)
+qqline(M$residuals)
+
+```
+
+
+**KNN Regression** 
+
+```{r}
+#Data formats 
+
+hourly_trips$holiday = as.numeric(hourly_trips$holiday)
+hourly_trips$month = as.numeric(hourly_trips$month)
+hourly_trips$day = as.numeric(hourly_trips$day)
+hourly_trips$outlier = ifelse(hourly_trips$num_trips>150,1,0)
+hourly_trips$num_trips = as.numeric(hourly_trips$num_trips)
+hourly_trips$hour = as.numeric(hourly_trips$hour)
+hourly_trips$trend = 1:dim(hourly_trips)[1]
+hourly_trips$lag_num_trips = lag(hourly_trips$num_trips)
+hourly_trips$lag2_num_trips = lag(hourly_trips$lag_num_trips)
+hourly_trips$lag_num_trips_day = lag(hourly_trips$num_trips, n = 24L)
+
+
+
+#Scaling the entire data frame: Standardization 
+
+knn_data = as.data.frame(drop_na(hourly_trips[,c(-6,-9)]))
+
+#knn_data[,2:8] =scale( knn_data[,2:8])
+
+#Model 
+
+validation = knn_data[knn_data$date >= "2020-03-01",]
+
+prediction = c()
+MAPE = c()
+RMSE = c()
+
+t = unique(validation$date)
+
+
+for (i in 1:length(t)){
+  train.x =knn_data[knn_data$date < t[i],c(-5,-1)]
+  test.x = knn_data[knn_data$date == t[i],c(-5,-1)]
+  train.y = knn_data[knn_data$date < t[i],5]
+  test.y = knn_data[knn_data$date == t[i],5]
+  
+  M = FNN::knn.reg(train = train.x, test = test.x, y = train.y, k = 5)
+  
+  prediction = c(prediction, M$pred)
+  x = accuracy(M$pred, test.y)
+  MAPE = c(MAPE, x[5])
+  RMSE = c(RMSE, x[2])
+}
+
+
+avg_mape = mean(MAPE)
+avg_RMSE = mean(RMSE)
+summary(M)
+avg_mape
+avg_RMSE
+
+```
+
+
+```{r}
+#visualization 
+
+
+plot(MAPE, type = "b")
+
+plot(RMSE, type="b")
+
+validation$predicition = prediction 
+
+plot(validation$num_trips)
+lines(validation$predicition, col = "blue")
+
+
+
+
+MAPE
+
+```
+
+
+**Decision Tree** 
+
+```{r}
+#hourly_trips$holiday = as.factor(hourly_trips$holiday)
+#hourly_trips$outlier = as.factor(hourly_trips$outlier)
+#hourly_trips$hour = as.factor(hourly_trips$hour)
+#hourly_trips$month = as.factor(hourly_trips$month)
+#hourly_trips$day = as.factor(hourly_trips$day)
+
+
+
+
+validation_set = hourly_trips[hourly_trips$date >= "2020-03-01",]
+a = unique(validation_set$date)
+prediction = c()
+MAPE = c()
+RMSE = c()
+
+
+#Base model
+
+
+tree_model = tree(num_trips~hour+month+day+holiday+lag_num_trips+lag2_num_trips+lag_num_trips_day+outlier, data = hourly_trips[hourly_trips$date < "2020-03-01",] )
+tree_model
+
+plot(tree_model)
+text(tree_model, pretty = 0)
+
+#using cross validation to see if the tree needs pruning 
+
+cv_tree_model = cv.tree(tree_model)
+plot(x = cv_tree_model$size, y = cv_tree_model$dev, type = "b", ylab = "RSS", xlab = "Tree size")
+
+#Looks like 9 is the best tree size 
+
+for (i in 1:length(a)){
+  training_set = hourly_trips[hourly_trips$date < a[i],]
+  b = hourly_trips[hourly_trips$date == a[i],]
+  M = tree(num_trips~hour+month+day+holiday+lag_num_trips+lag2_num_trips+lag_num_trips_day+outlier, data = training_set)
+  pruned_tree = prune.tree(M, best = 8)
+  
+  estimate = predict(pruned_tree, newdata= b)
+  prediction = c(prediction, estimate)
+  x = accuracy(estimate, b$num_trips)
+  MAPE = c(MAPE, x[5])
+  RMSE = c(RMSE, x[2])
+}
+
+
+avg_mape = mean(MAPE)
+avg_RMSE = mean(RMSE)
+
+avg_mape
+avg_RMSE
+
+
+```
+
+```{r}
+plot(MAPE, type = "b")
+
+plot(RMSE, type="b")
+
+validation_set$predicition = prediction 
+
+plot(validation_set$num_trips)
+lines(validation_set$predicition, col = "blue")
+
+```
+
+**Bagging** 
+
+```{r}
+hourly_trips$holiday = as.factor(hourly_trips$holiday)
+hourly_trips$outlier = as.factor(hourly_trips$outlier)
+hourly_trips$hour = as.factor(hourly_trips$hour)
+hourly_trips$month = as.factor(hourly_trips$month)
+hourly_trips$day = as.factor(hourly_trips$day)
+
+
+
+data = drop_na(hourly_trips)
+validation_set = hourly_trips[hourly_trips$date >= "2020-03-01",]
+hourly_trips = drop_na(hourly_trips)
+a = unique(validation_set$date)
+prediction = c()
+MAPE = c()
+RMSE = c()
+
+
+for (i in 1:length(a)){
+  
+  
+  b = hourly_trips[hourly_trips$date == a[i],]
+  
+  
+  M = ranger(formula = num_trips~hour+month+day+holiday+lag_num_trips+lag2_num_trips+outlier+lag_num_trips_day, data = data[data$date < a[i],], mtry = 8, num.trees = 800)
+  
+  estimate = predict(M, b)
+  prediction = c(prediction, estimate)
+  x = accuracy(prediction$predictions, b$num_trips)
+  MAPE = c(MAPE, x[5])
+  RMSE = c(RMSE, x[2])
+}
+
+
+avg_mape = mean(MAPE)
+avg_RMSE = mean(RMSE)
+
+avg_mape
+avg_RMSE
+
+?ranger
+```
+
+
+
+```{r}
+plot(MAPE, type = "b")
+
+plot(RMSE, type="b")
+
+validation_set$predicition = prediction$predictions
+
+plot(validation_set$num_trips)
+lines(validation_set$predicition, col = "blue")
+
+```
+
+
+**Random Forest** 
+
+```{r}
+hourly_trips$holiday = as.factor(hourly_trips$holiday)
+hourly_trips$outlier = as.factor(hourly_trips$outlier)
+hourly_trips$hour = as.factor(hourly_trips$hour)
+hourly_trips$month = as.factor(hourly_trips$month)
+hourly_trips$day = as.factor(hourly_trips$day)
+
+
+
+data = drop_na(hourly_trips)
+validation_set = hourly_trips[hourly_trips$date >= "2020-03-01",]
+hourly_trips = drop_na(hourly_trips)
+a = unique(validation_set$date)
+prediction = c()
+MAPE = c()
+RMSE = c()
+
+
+for (i in 1:length(a)){
+  
+  
+  b = hourly_trips[hourly_trips$date == a[i],]
+  
+  
+  M = ranger(formula = num_trips~hour+month+day+holiday+lag_num_trips+lag2_num_trips+outlier+lag_num_trips_day, data = data[data$date < a[i],], mtry = 3, num.trees = 800)
+  
+  estimate = predict(M, b)
+  prediction = c(prediction, estimate)
+  x = accuracy(prediction$predictions, b$num_trips)
+  MAPE = c(MAPE, x[5])
+  RMSE = c(RMSE, x[2])
+}
+
+
+avg_mape = mean(MAPE)
+avg_RMSE = mean(RMSE)
+
+avg_mape
+avg_RMSE
+
+
+
+
+```
+
+
+**Boosting** 
+
+```{r}
+
+data = drop_na(hourly_trips)
+validation_set = hourly_trips[hourly_trips$date >= "2020-03-01",]
+hourly_trips = drop_na(hourly_trips)
+a = unique(validation_set$date)
+prediction = c()
+MAPE = c()
+RMSE = c()
+
+
+for (i in 1:length(a)){
+  training_set = data[data$date < a[i],]
+  b = hourly_trips[hourly_trips$date == a[i],]
+  
+  M = gbm(num_trips~hour+month+day+holiday+lag_num_trips+lag2_num_trips+outlier+lag_num_trips_day, data = data[data$date < a[i],], distribution="gaussian", n.trees =400, interaction.depth = 4)
+  
+  estimate = predict(M, b, n.trees = 400)
+  prediction = c(prediction, estimate)
+  x = accuracy(estimate, b$num_trips)
+  MAPE = c(MAPE, x[5])
+  RMSE = c(RMSE, x[2])
+}
+
+
+avg_mape = mean(MAPE)
+avg_RMSE = mean(RMSE)
+
+avg_mape
+avg_RMSE
+
+```
+
+```{r}
+plot(MAPE, type = "b")
+
+plot(RMSE, type="b")
+
+validation_set$predicition = prediction 
+
+plot(validation_set$num_trips, type = 'b')
+lines(validation_set$predicition, col = "blue")
+
+```
+
+
+**Xgboost**
+
+```{r}
+hourly_trips$holiday = as.factor(hourly_trips$holiday)
+hourly_trips$outlier = as.factor(hourly_trips$outlier)
+hourly_trips$hour = as.factor(hourly_trips$hour)
+hourly_trips$month = as.factor(hourly_trips$month)
+hourly_trips$day = as.factor(hourly_trips$day)
+
+data = drop_na(hourly_trips)
+
+model = num_trips~hour+month+day+holiday+lag_num_trips+lag2_num_trips+outlier+lag_num_trips_day-1 
+
+data_xgboost=model.matrix(model,data=data)
+
+#data_xgboost[data$date == "2020-03-01",]###########
+
+
+validation_set = hourly_trips[hourly_trips$date >= "2020-03-01",]
+hourly_trips = drop_na(hourly_trips)
+a = unique(validation_set$date)
+prediction = c()
+MAPE = c()
+RMSE = c()
+
+
+for (i in 1:length(a)){
+  train = data_xgboost[data$date < a[i],]
+  test = data_xgboost[data$date == a[i],]
+  
+  b = hourly_trips[hourly_trips$date == a[i],]
+
+  M =  xgboost(train, data[1:(dim(train)[1]),]$num_trips,
+
+                       max_depth = 10,
+
+                       eta = 0.05,
+
+                       nrounds = 200,
+
+                       subsample = 0.6,
+
+                       colsample_bytree = 0.6,
+
+                       booster = "gbtree",
+
+                       eval_metric = "rmse",
+
+                       objective="reg:linear")
+  
+  estimate = predict(M, test)
+  prediction = c(prediction, estimate)
+  x = accuracy(estimate, b$num_trips)
+  MAPE = c(MAPE, x[5])
+  RMSE = c(RMSE, x[2])
+}
+
+
+avg_mape = mean(MAPE)
+avg_RMSE = mean(RMSE)
+avg_mape
+avg_RMSE
+
+```
+
+
+
+
+```{r}
+plot(MAPE, type = "b")
+
+plot(RMSE, type="b")
+
+validation_set$predicition = prediction 
+
+plot(validation_set$num_trips)
+lines(validation_set$predicition, col = "blue", type = 'l')
+```
+
+
+**Question 5 and 6**
+
+**Boosting** 
+
+```{r}
+
+data = drop_na(hourly_trips)
+validation_set = hourly_trips[hourly_trips$date >= "2020-03-01",]
+hourly_trips = drop_na(hourly_trips)
+a = unique(validation_set$date)
+prediction = c()
+MAPE = c()
+RMSE = c()
+
+
+for (i in 1:length(a)){
+  training_set = data[data$date < a[i],]
+  b = hourly_trips[hourly_trips$date == a[i],]
+  
+  M = gbm(num_trips~hour+month+day+holiday+lag_num_trips+lag2_num_trips+outlier+lag_num_trips_day, data = data[data$date < a[i],], distribution="gaussian", n.trees =400, interaction.depth = 4)
+  
+  estimate = predict(M, b, n.trees = 400)
+  prediction = c(prediction, estimate)
+  x = accuracy(estimate, b$num_trips)
+  MAPE = c(MAPE, x[5])
+  RMSE = c(RMSE, x[2])
+}
+
+
+avg_mape = mean(MAPE)
+avg_RMSE = mean(RMSE)
+
+avg_mape
+avg_RMSE
+
+```
+
+```{r}
+plot(MAPE, type = "b")
+
+plot(RMSE, type="b")
+
+validation_set$predicition = prediction 
+
+plot(validation_set$num_trips)
+lines(validation_set$predicition, col = "blue",, type = 'l')
+
+```
+
+#Confidence interval 
+
+```{r}
+#Confidence interval 
+
+CI = validation_set[,c(1,4,5,13)]
+
+CI$Interval = CI$predicition + 1.96*avg_RMSE
+CI$Interval_ = CI$predicition - 1.96*avg_RMSE
+
+CI
+```
+
+
+
+
+
+
+
+
